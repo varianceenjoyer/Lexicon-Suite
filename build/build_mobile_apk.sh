@@ -26,6 +26,12 @@ NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 
+# Model Configuration
+WHISPER_MODEL_ID="base-q5_1"
+WHISPER_MODEL_NAME="ggml-base-q5_1.bin"
+LEXICON_CLI="$LOCAL_SERVER_DIR/target/release/lexicon"
+LEXICON_MODEL_DIR="$HOME/.local/share/lexiconlocalserver/models"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,6 +65,102 @@ print_header() {
     echo " $1"
     echo "=============================================="
     echo ""
+}
+
+# =============================================================================
+# Model Management Functions
+# =============================================================================
+
+ensure_lexicon_cli() {
+    if [ -x "$LEXICON_CLI" ]; then
+        log_success "Lexicon CLI found: $LEXICON_CLI"
+        return 0
+    fi
+
+    log_info "Lexicon CLI not found, building..."
+
+    if [ ! -f "$LOCAL_SERVER_DIR/scripts/build.sh" ]; then
+        log_error "Build script not found: $LOCAL_SERVER_DIR/scripts/build.sh"
+        return 1
+    fi
+
+    (
+        cd "$LOCAL_SERVER_DIR"
+        ./scripts/build.sh
+    )
+
+    if [ -x "$LEXICON_CLI" ]; then
+        log_success "Lexicon CLI built successfully"
+        return 0
+    else
+        log_error "Failed to build Lexicon CLI"
+        return 1
+    fi
+}
+
+ensure_whisper_model() {
+    local MOBILE_MODEL_DIR="$MOBILE_DIR/assets/models"
+    local MOBILE_MODEL_FILE="$MOBILE_MODEL_DIR/$WHISPER_MODEL_NAME"
+
+    print_header "Ensuring Whisper Model"
+
+    # Check if model already exists in mobile assets
+    if [ -f "$MOBILE_MODEL_FILE" ]; then
+        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
+        log_success "Model already exists: $MOBILE_MODEL_FILE ($SIZE)"
+        return 0
+    fi
+
+    # Check if model exists in Lexicon-Local-Server/models/ (bundled)
+    local SERVER_MODEL_FILE="$LOCAL_SERVER_DIR/models/$WHISPER_MODEL_NAME"
+    if [ -f "$SERVER_MODEL_FILE" ]; then
+        log_info "Found model in Lexicon-Local-Server/models/, copying..."
+        mkdir -p "$MOBILE_MODEL_DIR"
+        cp "$SERVER_MODEL_FILE" "$MOBILE_MODEL_FILE"
+        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
+        log_success "Copied model to mobile assets ($SIZE)"
+        return 0
+    fi
+
+    # Check if model exists in lexicon cache
+    local CACHE_MODEL_FILE="$LEXICON_MODEL_DIR/$WHISPER_MODEL_NAME"
+    if [ -f "$CACHE_MODEL_FILE" ]; then
+        log_info "Found model in lexicon cache, copying..."
+        mkdir -p "$MOBILE_MODEL_DIR"
+        cp "$CACHE_MODEL_FILE" "$MOBILE_MODEL_FILE"
+        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
+        log_success "Copied model from cache ($SIZE)"
+        return 0
+    fi
+
+    # Need to download via lexicon CLI
+    log_info "Model not found locally, downloading via lexicon CLI..."
+
+    # Ensure lexicon CLI exists
+    if ! ensure_lexicon_cli; then
+        log_error "Cannot download model: lexicon CLI unavailable"
+        return 1
+    fi
+
+    # Download the model
+    log_info "Downloading model: $WHISPER_MODEL_ID"
+    if ! "$LEXICON_CLI" models download "$WHISPER_MODEL_ID"; then
+        log_error "Failed to download model"
+        return 1
+    fi
+
+    # Copy from cache to mobile assets
+    if [ -f "$CACHE_MODEL_FILE" ]; then
+        mkdir -p "$MOBILE_MODEL_DIR"
+        cp "$CACHE_MODEL_FILE" "$MOBILE_MODEL_FILE"
+        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
+        log_success "Model downloaded and copied to mobile assets ($SIZE)"
+        return 0
+    else
+        log_error "Model download succeeded but file not found at expected location"
+        log_error "Expected: $CACHE_MODEL_FILE"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -117,15 +219,13 @@ check_prerequisites() {
         log_success "Lexicon-Mobile found"
     fi
 
-    # Check required assets
-    local MODEL_FILE="$MOBILE_DIR/assets/models/ggml-base-q5_1.bin"
+    # Check assets (informational - model will be downloaded if missing)
+    local MODEL_FILE="$MOBILE_DIR/assets/models/$WHISPER_MODEL_NAME"
     if [ ! -f "$MODEL_FILE" ]; then
-        log_error "Whisper model not found at $MODEL_FILE"
-        log_info "Download or copy the ggml-base-q5_1.bin model to assets/models/"
-        missing=1
+        log_info "Whisper model not found (will be downloaded automatically)"
     else
         local MODEL_SIZE=$(ls -lh "$MODEL_FILE" | awk '{print $5}')
-        log_success "Whisper model found: ggml-base-q5_1.bin ($MODEL_SIZE)"
+        log_success "Whisper model found: $WHISPER_MODEL_NAME ($MODEL_SIZE)"
     fi
 
     local TEST_AUDIO="$MOBILE_DIR/assets/audio/woodchuck.wav"
@@ -433,6 +533,7 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  --skip-rust    Skip Rust library build (use existing)"
+    echo "  --skip-model   Skip Whisper model check/download"
     echo "  --skip-deploy  Skip device deployment"
     echo "  --help, -h     Show this help message"
     echo ""
@@ -442,7 +543,7 @@ print_usage() {
     echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 4)"
     echo ""
     echo "Bundled Assets (in Lexicon-Mobile/assets/):"
-    echo "  models/ggml-base-q5_1.bin  Whisper base model for STT (required)"
+    echo "  models/ggml-base-q5_1.bin  Whisper base model for STT (auto-downloaded)"
     echo "  audio/woodchuck.wav        Test audio for transcription (optional)"
     echo ""
     echo "Examples:"
@@ -457,6 +558,7 @@ print_usage() {
 main() {
     local TARGET="x86_64"
     local SKIP_RUST=false
+    local SKIP_MODEL=false
     local SKIP_DEPLOY=false
 
     # Parse arguments
@@ -468,6 +570,10 @@ main() {
                 ;;
             --skip-rust)
                 SKIP_RUST=true
+                shift
+                ;;
+            --skip-model)
+                SKIP_MODEL=true
                 shift
                 ;;
             --skip-deploy)
@@ -489,12 +595,19 @@ main() {
     print_header "Lexicon Mobile APK Build"
     log_info "Target: $TARGET"
     log_info "Skip Rust: $SKIP_RUST"
+    log_info "Skip Model: $SKIP_MODEL"
     log_info "Skip Deploy: $SKIP_DEPLOY"
     log_info "NDK: $ANDROID_NDK_HOME"
     log_info "API Level: $ANDROID_API"
 
     # Run build pipeline
     check_prerequisites
+
+    if [ "$SKIP_MODEL" = false ]; then
+        ensure_whisper_model
+    else
+        log_info "Skipping model check (--skip-model)"
+    fi
 
     if [ "$SKIP_RUST" = false ]; then
         build_rust_libraries "$TARGET"
