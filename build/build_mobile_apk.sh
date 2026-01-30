@@ -117,6 +117,25 @@ check_prerequisites() {
         log_success "Lexicon-Mobile found"
     fi
 
+    # Check required assets
+    local MODEL_FILE="$MOBILE_DIR/assets/models/ggml-base-q5_1.bin"
+    if [ ! -f "$MODEL_FILE" ]; then
+        log_error "Whisper model not found at $MODEL_FILE"
+        log_info "Download or copy the ggml-base-q5_1.bin model to assets/models/"
+        missing=1
+    else
+        local MODEL_SIZE=$(ls -lh "$MODEL_FILE" | awk '{print $5}')
+        log_success "Whisper model found: ggml-base-q5_1.bin ($MODEL_SIZE)"
+    fi
+
+    local TEST_AUDIO="$MOBILE_DIR/assets/audio/woodchuck.wav"
+    if [ ! -f "$TEST_AUDIO" ]; then
+        log_warn "Test audio not found at $TEST_AUDIO (optional)"
+    else
+        local AUDIO_SIZE=$(ls -lh "$TEST_AUDIO" | awk '{print $5}')
+        log_success "Test audio found: woodchuck.wav ($AUDIO_SIZE)"
+    fi
+
     # Check Rust targets
     local rust_targets=$(rustup target list --installed)
     for target in aarch64-linux-android x86_64-linux-android armv7-linux-androideabi; do
@@ -287,6 +306,17 @@ build_flutter_apk() {
 
     cd "$MOBILE_DIR"
 
+    # List bundled assets
+    log_info "Bundled assets:" >&2
+    if [ -f "$MOBILE_DIR/assets/models/ggml-base-q5_1.bin" ]; then
+        local MODEL_SIZE=$(ls -lh "$MOBILE_DIR/assets/models/ggml-base-q5_1.bin" | awk '{print $5}')
+        log_info "  - Whisper model: ggml-base-q5_1.bin ($MODEL_SIZE)" >&2
+    fi
+    if [ -f "$MOBILE_DIR/assets/audio/woodchuck.wav" ]; then
+        local AUDIO_SIZE=$(ls -lh "$MOBILE_DIR/assets/audio/woodchuck.wav" | awk '{print $5}')
+        log_info "  - Test audio: woodchuck.wav ($AUDIO_SIZE)" >&2
+    fi
+
     # Clean previous builds
     log_info "Cleaning previous builds..." >&2
     flutter clean >&2
@@ -410,6 +440,10 @@ print_usage() {
     echo "  ANDROID_NDK_HOME    Path to Android NDK (default: ~/Android/Sdk/ndk/29.0.14206865)"
     echo "  ANDROID_API         Android API level (default: 26)"
     echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 4)"
+    echo ""
+    echo "Bundled Assets (in Lexicon-Mobile/assets/):"
+    echo "  models/ggml-base-q5_1.bin  Whisper base model for STT (required)"
+    echo "  audio/woodchuck.wav        Test audio for transcription (optional)"
     echo ""
     echo "Examples:"
     echo "  $0                  # Build x86_64 and deploy (default)"
