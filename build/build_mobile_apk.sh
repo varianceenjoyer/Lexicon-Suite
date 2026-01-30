@@ -150,20 +150,35 @@ build_rust_target() {
 
     log_info "Building lexicon-flutter for $TARGET (features: $FEATURES)"
 
-    export CC_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
-    export CXX_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang++"
-    export AR_${CC_VAR}="$TOOLCHAIN/llvm-ar"
-    export ANDROID_NDK_HOME
-    export CMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
-    export CARGO_BUILD_JOBS
+    # Run cargo build in a subshell to isolate environment changes
+    (
+        export CC_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
+        export CXX_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang++"
+        export AR_${CC_VAR}="$TOOLCHAIN/llvm-ar"
+        # Configure the Rust linker for this target (uppercase with underscores for Cargo env vars)
+        CARGO_TARGET_VAR="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+        export "${CARGO_TARGET_VAR}"="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
+        export ANDROID_NDK_HOME
+        # Don't use CMAKE_TOOLCHAIN_FILE - let cmake-rs handle Android cross-compilation
+        # Set the required CMake variables directly for Android cross-compilation
+        export ANDROID_ABI="$ABI"
+        export ANDROID_PLATFORM="android-${ANDROID_API}"
+        export ANDROID_NDK="$ANDROID_NDK_HOME"
+        # cmake-rs uses these for Android detection
+        export CMAKE_ANDROID_NDK="$ANDROID_NDK_HOME"
+        export CMAKE_ANDROID_ARCH_ABI="$ABI"
+        export CMAKE_SYSTEM_NAME="Android"
+        export CMAKE_SYSTEM_VERSION="${ANDROID_API}"
+        export CARGO_BUILD_JOBS
 
-    cd "$LOCAL_SERVER_DIR"
+        cd "$LOCAL_SERVER_DIR"
 
-    if [ "$FEATURES" = "default" ]; then
-        cargo build -p lexicon-flutter --target "$TARGET" --release
-    else
-        cargo build -p lexicon-flutter --target "$TARGET" --release --no-default-features --features "$FEATURES"
-    fi
+        if [ "$FEATURES" = "default" ]; then
+            cargo build -p lexicon-flutter --target "$TARGET" --release
+        else
+            cargo build -p lexicon-flutter --target "$TARGET" --release --no-default-features --features "$FEATURES"
+        fi
+    )
 
     # Verify output
     local OUTPUT="$LOCAL_SERVER_DIR/target/$TARGET/release/liblexicon_flutter.so"
@@ -267,36 +282,38 @@ copy_libraries() {
 # =============================================================================
 
 build_flutter_apk() {
-    print_header "Building Flutter APK"
+    # All output goes to stderr except the final APK path
+    print_header "Building Flutter APK" >&2
 
     cd "$MOBILE_DIR"
 
     # Clean previous builds
-    log_info "Cleaning previous builds..."
-    flutter clean
+    log_info "Cleaning previous builds..." >&2
+    flutter clean >&2
 
     # Get dependencies
-    log_info "Getting Flutter dependencies..."
-    flutter pub get
+    log_info "Getting Flutter dependencies..." >&2
+    flutter pub get >&2
 
     # Run build_runner if needed
     if grep -q "build_runner" pubspec.yaml 2>/dev/null; then
-        log_info "Running build_runner..."
-        flutter pub run build_runner build --delete-conflicting-outputs || true
+        log_info "Running build_runner..." >&2
+        flutter pub run build_runner build --delete-conflicting-outputs >&2 || true
     fi
 
     # Build APK
-    log_info "Building release APK..."
-    flutter build apk --release
+    log_info "Building release APK..." >&2
+    flutter build apk --release >&2
 
     # Verify output
     local APK_PATH="$MOBILE_DIR/build/app/outputs/flutter-apk/app-release.apk"
     if [ -f "$APK_PATH" ]; then
         local SIZE=$(ls -lh "$APK_PATH" | awk '{print $5}')
-        log_success "APK built successfully: $APK_PATH ($SIZE)"
+        log_success "APK built successfully: $APK_PATH ($SIZE)" >&2
+        # Only this line goes to stdout for capture
         echo "$APK_PATH"
     else
-        log_error "APK build failed: $APK_PATH not found"
+        log_error "APK build failed: $APK_PATH not found" >&2
         exit 1
     fi
 }
