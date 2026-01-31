@@ -227,15 +227,17 @@ check_prerequisites() {
     fi
 
     # Check adb (optional, for deployment)
-    # NOTE: When running in WSL2 with Android emulator on Windows, the WSL2 adb
-    # cannot directly see Windows emulator devices. You have two options:
-    #   1. Use Windows adb.exe from PowerShell to install the APK
-    #   2. Copy APK to Windows and run: adb.exe install -r <path-to-apk>
-    # The APK path will be printed at the end of the build.
-    if ! command -v adb &> /dev/null; then
-        log_warn "adb not found. Device deployment will be skipped."
-    else
+    # In WSL2, prefer Windows adb.exe to communicate with Windows emulator
+    WINDOWS_ADB="/mnt/n/.DEV/tools/Android/platform-tools/adb.exe"
+    if [ -f "$WINDOWS_ADB" ]; then
+        ADB_CMD="$WINDOWS_ADB"
+        log_success "Windows adb.exe found (WSL2 mode)"
+    elif command -v adb &> /dev/null; then
+        ADB_CMD="adb"
         log_success "adb found: $(adb version | head -1)"
+    else
+        ADB_CMD=""
+        log_warn "adb not found. Device deployment will be skipped."
     fi
 
     # Check project directories
@@ -567,14 +569,21 @@ deploy_to_device() {
 
     print_header "Deploying to Device"
 
-    if ! command -v adb &> /dev/null; then
+    if [ -z "$ADB_CMD" ]; then
         log_warn "adb not found. Skipping device deployment."
         print_manual_install_instructions "$APK_PATH"
         return
     fi
 
+    # For Windows adb.exe, convert WSL path to Windows path
+    local INSTALL_PATH="$APK_PATH"
+    if [[ "$ADB_CMD" == *.exe ]]; then
+        INSTALL_PATH=$(wslpath -w "$APK_PATH")
+        log_info "Using Windows path: $INSTALL_PATH"
+    fi
+
     # Check for connected devices
-    local DEVICES=$(adb devices | grep -v "^List" | grep -v "^$" | grep "device$")
+    local DEVICES=$("$ADB_CMD" devices | grep -v "^List" | grep -v "^$" | grep "device$")
 
     if [ -z "$DEVICES" ]; then
         log_warn "No adb devices found online."
@@ -595,7 +604,7 @@ deploy_to_device() {
         local DEVICE_ID=$(echo "$line" | awk '{print $1}')
         if [ -n "$DEVICE_ID" ]; then
             log_info "Installing to device: $DEVICE_ID"
-            if adb -s "$DEVICE_ID" install -r "$APK_PATH"; then
+            if "$ADB_CMD" -s "$DEVICE_ID" install -r "$INSTALL_PATH"; then
                 log_success "Installed successfully on $DEVICE_ID"
             else
                 log_error "Installation failed on $DEVICE_ID"
@@ -612,29 +621,28 @@ print_manual_install_instructions() {
     echo " Manual Installation Instructions"
     echo "=============================================="
     echo ""
-    echo "To install the APK manually, connect your device and run:"
-    echo ""
-    echo "  adb install -r \"$APK_PATH\""
-    echo ""
-    echo "Or for a specific device:"
-    echo ""
-    echo "  adb -s <device-id> install -r \"$APK_PATH\""
+
+    # Show appropriate command based on detected adb
+    if [ -n "$ADB_CMD" ]; then
+        if [[ "$ADB_CMD" == *.exe ]]; then
+            local WIN_PATH=$(wslpath -w "$APK_PATH")
+            echo "To install the APK manually (using Windows adb.exe):"
+            echo ""
+            echo "  $ADB_CMD install -r \"$WIN_PATH\""
+        else
+            echo "To install the APK manually:"
+            echo ""
+            echo "  adb install -r \"$APK_PATH\""
+        fi
+    else
+        echo "To install the APK manually, connect your device and run:"
+        echo ""
+        echo "  adb install -r \"$APK_PATH\""
+    fi
     echo ""
     echo "To list available devices:"
     echo ""
-    echo "  adb devices"
-    echo ""
-    echo "=== WSL2 with Windows Emulator ==="
-    echo ""
-    echo "If running in WSL2 with Android emulator on Windows, WSL2 adb cannot"
-    echo "see the Windows emulator. Use Windows adb.exe instead:"
-    echo ""
-    echo "  # From PowerShell/CMD, with APK path converted to Windows format:"
-    echo "  adb.exe install -r \\\\wsl\$\\Ubuntu$APK_PATH"
-    echo ""
-    echo "  # Or copy to Windows first:"
-    echo "  cp \"$APK_PATH\" /mnt/c/temp/"
-    echo "  # Then from PowerShell: adb.exe install -r C:\\temp\\app-release.apk"
+    echo "  ${ADB_CMD:-adb} devices"
     echo ""
 }
 
