@@ -23,7 +23,8 @@ TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
 
 # Build Configuration
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+# Reduced from 4 to 2 - each job uses 1-2GB RAM, and LTO phase uses 2-3GB more
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 
 # Model Configuration
@@ -65,6 +66,34 @@ print_header() {
     echo " $1"
     echo "=============================================="
     echo ""
+}
+
+# =============================================================================
+# Memory Management Functions
+# =============================================================================
+
+get_available_memory_gb() {
+    if [ -f /proc/meminfo ]; then
+        awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo
+    else
+        echo "8"  # Assume 8GB if can't detect
+    fi
+}
+
+adjust_build_settings() {
+    local available_gb=$(get_available_memory_gb)
+    log_info "Available memory: ${available_gb}GB"
+
+    # Only adjust if CARGO_BUILD_JOBS wasn't explicitly set by user
+    if [ -z "${CARGO_BUILD_JOBS_USER_SET:-}" ]; then
+        if [ "$available_gb" -lt 6 ]; then
+            export CARGO_BUILD_JOBS=1
+            log_warn "Low memory (${available_gb}GB) - using single-threaded Rust build"
+        elif [ "$available_gb" -lt 10 ]; then
+            export CARGO_BUILD_JOBS=2
+            log_info "Limited memory (${available_gb}GB) - using 2 parallel Rust jobs"
+        fi
+    fi
 }
 
 # =============================================================================
@@ -463,9 +492,13 @@ build_flutter_apk() {
         log_info "  - Test audio: woodchuck.wav ($AUDIO_SIZE)" >&2
     fi
 
-    # Clean previous builds
-    log_info "Cleaning previous builds..." >&2
-    flutter clean >&2
+    # Only clean if --clean flag was passed (saves 50-70% build time on incremental builds)
+    if [ "$FORCE_CLEAN" = true ]; then
+        log_info "Cleaning previous builds (--clean)..." >&2
+        flutter clean >&2
+    else
+        log_info "Incremental build (use --clean for full rebuild)" >&2
+    fi
 
     # Get dependencies
     log_info "Getting Flutter dependencies..." >&2
@@ -624,13 +657,14 @@ print_usage() {
     echo "  --skip-rust    Skip Rust library build (use existing)"
     echo "  --skip-model   Skip Whisper model check/download"
     echo "  --skip-deploy  Skip device deployment"
+    echo "  --clean        Force full Flutter rebuild (default: incremental)"
     echo "  --keep-daemons Keep Gradle/Kotlin daemons running after build"
     echo "  --help, -h     Show this help message"
     echo ""
     echo "Environment Variables:"
     echo "  ANDROID_NDK_HOME    Path to Android NDK (default: ~/Android/Sdk/ndk/29.0.14206865)"
     echo "  ANDROID_API         Android API level (default: 26)"
-    echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 4)"
+    echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 2, auto-adjusts based on available RAM)"
     echo ""
     echo "Bundled Assets (in Lexicon-Mobile/assets/):"
     echo "  models/ggml-base-q5_1.bin  Whisper base model for STT (auto-downloaded)"
@@ -651,6 +685,7 @@ main() {
     local SKIP_MODEL=false
     local SKIP_DEPLOY=false
     local KEEP_DAEMONS=false
+    FORCE_CLEAN=false  # Global for use in build_flutter_apk
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -675,6 +710,10 @@ main() {
                 KEEP_DAEMONS=true
                 shift
                 ;;
+            --clean)
+                FORCE_CLEAN=true
+                shift
+                ;;
             --help|-h)
                 print_usage
                 exit 0
@@ -692,12 +731,16 @@ main() {
     log_info "Skip Rust: $SKIP_RUST"
     log_info "Skip Model: $SKIP_MODEL"
     log_info "Skip Deploy: $SKIP_DEPLOY"
+    log_info "Force Clean: $FORCE_CLEAN"
     log_info "Keep Daemons: $KEEP_DAEMONS"
     log_info "NDK: $ANDROID_NDK_HOME"
     log_info "API Level: $ANDROID_API"
 
     # Run build pipeline
     check_prerequisites
+
+    # Auto-adjust build settings based on available memory
+    adjust_build_settings
 
     if [ "$SKIP_MODEL" = false ]; then
         ensure_whisper_model
