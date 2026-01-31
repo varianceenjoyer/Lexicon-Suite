@@ -277,6 +277,18 @@ build_rust_target() {
         # Configure the Rust linker for this target (uppercase with underscores for Cargo env vars)
         CARGO_TARGET_VAR="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
         export "${CARGO_TARGET_VAR}"="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
+
+        # CRITICAL: Force libc++ usage for Android compatibility
+        # Android uses libc++, not libstdc++. Without these flags, C++ dependencies
+        # (like whisper.cpp) will link against libstdc++ symbols that don't exist on Android.
+        export CXXFLAGS="-stdlib=libc++"
+        export CFLAGS=""
+        export LDFLAGS="-stdlib=libc++ -lc++_shared"
+
+        # Set rustflags to pass libc++ to the linker for C++ dependencies
+        CARGO_TARGET_RUSTFLAGS_VAR="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
+        export "${CARGO_TARGET_RUSTFLAGS_VAR}"="-C link-arg=-stdlib=libc++"
+
         export ANDROID_NDK_HOME
         # Don't use CMAKE_TOOLCHAIN_FILE - let cmake-rs handle Android cross-compilation
         # Set the required CMake variables directly for Android cross-compilation
@@ -288,6 +300,10 @@ build_rust_target() {
         export CMAKE_ANDROID_ARCH_ABI="$ABI"
         export CMAKE_SYSTEM_NAME="Android"
         export CMAKE_SYSTEM_VERSION="${ANDROID_API}"
+        # Force CMake to use libc++ for all C++ compilations
+        export CMAKE_CXX_FLAGS="-stdlib=libc++"
+        export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
+        export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
         export CARGO_BUILD_JOBS
 
         cd "$LOCAL_SERVER_DIR"
