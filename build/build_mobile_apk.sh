@@ -536,28 +536,74 @@ build_flutter_apk() {
 stop_build_daemons() {
     print_header "Stopping Build Daemons"
 
-    # Stop Gradle daemon
+    # Gracefully stop Gradle daemon (this also handles the Kotlin daemon)
+    # Note: gradle.properties configures org.gradle.daemon.idletimeout=300000 (5 min)
+    # so any daemons not stopped here will self-terminate after 5 minutes idle
     if [ -f "$MOBILE_DIR/android/gradlew" ]; then
-        log_info "Stopping Gradle daemon..."
-        (cd "$MOBILE_DIR/android" && ./gradlew --stop 2>/dev/null) || true
+        log_info "Requesting graceful Gradle daemon shutdown..."
+        (cd "$MOBILE_DIR/android" && timeout 15 ./gradlew --stop 2>/dev/null) || true
     fi
 
-    # Stop Kotlin compile daemon
-    if pgrep -f "kotlin.daemon.KotlinCompileDaemon" > /dev/null 2>&1; then
-        log_info "Stopping Kotlin compile daemon..."
-        pkill -f "kotlin.daemon.KotlinCompileDaemon" 2>/dev/null || true
-    fi
+    # Give time for graceful shutdown
+    sleep 3
 
-    # Give time for cleanup
-    sleep 2
+    # Verify cleanup (informational - daemons will self-terminate via idletimeout if still running)
+    local GRADLE_PROCS
+    local KOTLIN_PROCS
+    GRADLE_PROCS=$(pgrep -c "GradleDaemon" 2>/dev/null) || GRADLE_PROCS=0
+    KOTLIN_PROCS=$(pgrep -c "KotlinCompileDaemon" 2>/dev/null) || KOTLIN_PROCS=0
 
-    # Verify cleanup
-    local REMAINING=$(ps aux | grep -E '[g]radle.*[d]aemon|[k]otlin.*[D]aemon' | wc -l)
-    if [ "$REMAINING" -eq 0 ]; then
-        log_success "All build daemons stopped"
+    if [ "$GRADLE_PROCS" -eq 0 ] && [ "$KOTLIN_PROCS" -eq 0 ]; then
+        log_success "All build daemons stopped gracefully"
     else
-        log_warn "Some daemons may still be running (will idle-timeout eventually)"
+        log_info "Daemons still running: Gradle=$GRADLE_PROCS, Kotlin=$KOTLIN_PROCS"
+        log_info "They will self-terminate in 5 minutes (org.gradle.daemon.idletimeout)"
     fi
+}
+
+# =============================================================================
+# Memory Cleanup Functions
+# =============================================================================
+
+drop_filesystem_cache() {
+    print_header "Dropping Filesystem Cache"
+
+    # Get memory before cleanup
+    local BEFORE_CACHE=$(free -m | awk '/^Mem:/ {print $6}')
+    local BEFORE_AVAIL=$(free -m | awk '/^Mem:/ {print $7}')
+
+    log_info "Before: ${BEFORE_CACHE}MB buff/cache, ${BEFORE_AVAIL}MB available"
+
+    # Sync to flush dirty pages first
+    sync
+
+    # Try to drop caches (requires root or appropriate permissions)
+    if [ -w /proc/sys/vm/drop_caches ]; then
+        # Drop pagecache, dentries, and inodes
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+        log_success "Dropped filesystem caches"
+    elif command -v sudo &> /dev/null; then
+        # Try with sudo (may prompt for password or fail silently)
+        if sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+            log_success "Dropped filesystem caches (via sudo)"
+        else
+            log_warn "Cannot drop caches (requires sudo password or root)"
+            log_info "Run manually: sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+            return 0
+        fi
+    else
+        log_warn "Cannot drop caches (no write access to /proc/sys/vm/drop_caches)"
+        log_info "Run manually: sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+        return 0
+    fi
+
+    # Get memory after cleanup
+    local AFTER_CACHE=$(free -m | awk '/^Mem:/ {print $6}')
+    local AFTER_AVAIL=$(free -m | awk '/^Mem:/ {print $7}')
+    local FREED=$((BEFORE_CACHE - AFTER_CACHE))
+
+    log_info "After: ${AFTER_CACHE}MB buff/cache, ${AFTER_AVAIL}MB available"
+    log_success "Freed ${FREED}MB of cached memory"
 }
 
 # =============================================================================
@@ -780,6 +826,9 @@ main() {
         log_info "Keeping daemons running (--keep-daemons)"
         log_warn "Run './gradlew --stop' manually to reclaim ~5-6GB memory"
     fi
+
+    # Drop filesystem cache to reclaim memory used during build
+    drop_filesystem_cache
 
     # Final summary
     print_header "Build Complete!"
