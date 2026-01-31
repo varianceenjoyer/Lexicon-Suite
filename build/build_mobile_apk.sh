@@ -27,8 +27,8 @@ CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 
 # Model Configuration
-WHISPER_MODEL_ID="base-q5_1"
-WHISPER_MODEL_NAME="ggml-base-q5_1.bin"
+WHISPER_MODEL_ID="tiny-q5_1"
+WHISPER_MODEL_NAME="ggml-tiny-q5_1.bin"
 LEXICON_CLI="$LOCAL_SERVER_DIR/target/release/lexicon"
 LEXICON_MODEL_DIR="$HOME/.local/share/lexiconlocalserver/models"
 
