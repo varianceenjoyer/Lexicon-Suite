@@ -269,11 +269,28 @@ build_rust_target() {
 
     log_info "Building lexicon-flutter for $TARGET (features: $FEATURES)"
 
+    # Create wrapper scripts that inject -stdlib=libc++ for C++ compilation
+    # This is necessary because cmake-rs doesn't reliably pass CXXFLAGS to cmake
+    local WRAPPER_DIR="$SCRIPT_DIR/.clang-wrappers/$TARGET"
+    mkdir -p "$WRAPPER_DIR"
+
+    local REAL_CXX="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang++"
+
+    # Create C++ compiler wrapper that injects -stdlib=libc++
+    cat > "$WRAPPER_DIR/clang++" << EOF
+#!/bin/bash
+# Wrapper to force libc++ for Android C++ compilation
+exec "$REAL_CXX" -stdlib=libc++ "\$@"
+EOF
+    chmod +x "$WRAPPER_DIR/clang++"
+
     # Run cargo build in a subshell to isolate environment changes
     (
         export CC_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
-        export CXX_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang++"
+        # Use wrapper for C++ to ensure -stdlib=libc++ is always passed
+        export CXX_${CC_VAR}="$WRAPPER_DIR/clang++"
         export AR_${CC_VAR}="$TOOLCHAIN/llvm-ar"
+
         # Configure the Rust linker for this target (uppercase with underscores for Cargo env vars)
         CARGO_TARGET_VAR="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
         export "${CARGO_TARGET_VAR}"="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
@@ -300,13 +317,19 @@ build_rust_target() {
         export CMAKE_ANDROID_ARCH_ABI="$ABI"
         export CMAKE_SYSTEM_NAME="Android"
         export CMAKE_SYSTEM_VERSION="${ANDROID_API}"
-        # Force CMake to use libc++ for all C++ compilations
+        # Force CMake to use our wrapper compiler that injects -stdlib=libc++
+        export CMAKE_CXX_COMPILER="$WRAPPER_DIR/clang++"
+        export CMAKE_C_COMPILER="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
+        # Also set flags as backup
         export CMAKE_CXX_FLAGS="-stdlib=libc++"
-        export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
-        export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
+        export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
+        export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CARGO_BUILD_JOBS
 
         cd "$LOCAL_SERVER_DIR"
+
+        # Clean whisper-rs-sys build cache to force rebuild with new flags
+        rm -rf target/$TARGET/release/build/whisper-rs-sys-* 2>/dev/null || true
 
         if [ "$FEATURES" = "default" ]; then
             cargo build -p lexicon-flutter --target "$TARGET" --release
@@ -333,7 +356,9 @@ build_rust_libraries() {
 
     case "$TARGETS" in
         arm64)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "default" "arm64-v8a"
+            # Use stt-only features for arm64 to avoid ONNX Runtime libstdc++ issues
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt" "arm64-v8a"
+            log_warn "TTS disabled for arm64 (ONNX Runtime has libstdc++ compatibility issues)"
             ;;
         x86_64)
             build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt" "x86_64"
@@ -465,6 +490,37 @@ build_flutter_apk() {
 }
 
 # =============================================================================
+# Daemon Cleanup Functions
+# =============================================================================
+
+stop_build_daemons() {
+    print_header "Stopping Build Daemons"
+
+    # Stop Gradle daemon
+    if [ -f "$MOBILE_DIR/android/gradlew" ]; then
+        log_info "Stopping Gradle daemon..."
+        (cd "$MOBILE_DIR/android" && ./gradlew --stop 2>/dev/null) || true
+    fi
+
+    # Stop Kotlin compile daemon
+    if pgrep -f "kotlin.daemon.KotlinCompileDaemon" > /dev/null 2>&1; then
+        log_info "Stopping Kotlin compile daemon..."
+        pkill -f "kotlin.daemon.KotlinCompileDaemon" 2>/dev/null || true
+    fi
+
+    # Give time for cleanup
+    sleep 2
+
+    # Verify cleanup
+    local REMAINING=$(ps aux | grep -E '[g]radle.*[d]aemon|[k]otlin.*[D]aemon' | wc -l)
+    if [ "$REMAINING" -eq 0 ]; then
+        log_success "All build daemons stopped"
+    else
+        log_warn "Some daemons may still be running (will idle-timeout eventually)"
+    fi
+}
+
+# =============================================================================
 # Device Deployment Functions
 # =============================================================================
 
@@ -551,6 +607,7 @@ print_usage() {
     echo "  --skip-rust    Skip Rust library build (use existing)"
     echo "  --skip-model   Skip Whisper model check/download"
     echo "  --skip-deploy  Skip device deployment"
+    echo "  --keep-daemons Keep Gradle/Kotlin daemons running after build"
     echo "  --help, -h     Show this help message"
     echo ""
     echo "Environment Variables:"
@@ -576,6 +633,7 @@ main() {
     local SKIP_RUST=false
     local SKIP_MODEL=false
     local SKIP_DEPLOY=false
+    local KEEP_DAEMONS=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -596,6 +654,10 @@ main() {
                 SKIP_DEPLOY=true
                 shift
                 ;;
+            --keep-daemons)
+                KEEP_DAEMONS=true
+                shift
+                ;;
             --help|-h)
                 print_usage
                 exit 0
@@ -613,6 +675,7 @@ main() {
     log_info "Skip Rust: $SKIP_RUST"
     log_info "Skip Model: $SKIP_MODEL"
     log_info "Skip Deploy: $SKIP_DEPLOY"
+    log_info "Keep Daemons: $KEEP_DAEMONS"
     log_info "NDK: $ANDROID_NDK_HOME"
     log_info "API Level: $ANDROID_API"
 
@@ -640,6 +703,14 @@ main() {
     else
         log_info "Skipping deployment (--skip-deploy)"
         print_manual_install_instructions "$APK_PATH"
+    fi
+
+    # Stop build daemons to reclaim memory (unless --keep-daemons)
+    if [ "$KEEP_DAEMONS" = false ]; then
+        stop_build_daemons
+    else
+        log_info "Keeping daemons running (--keep-daemons)"
+        log_warn "Run './gradlew --stop' manually to reclaim ~5-6GB memory"
     fi
 
     # Final summary

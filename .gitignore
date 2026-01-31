@@ -4,3 +4,6 @@ Lexicon-Mobile/
 Lexicon-Desktop/
 Lexicon-IEM/
 Lexicon-Studio/
+
+# Build artifacts
+build/.clang-wrappers/
