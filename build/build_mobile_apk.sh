@@ -198,6 +198,11 @@ check_prerequisites() {
     fi
 
     # Check adb (optional, for deployment)
+    # NOTE: When running in WSL2 with Android emulator on Windows, the WSL2 adb
+    # cannot directly see Windows emulator devices. You have two options:
+    #   1. Use Windows adb.exe from PowerShell to install the APK
+    #   2. Copy APK to Windows and run: adb.exe install -r <path-to-apk>
+    # The APK path will be printed at the end of the build.
     if ! command -v adb &> /dev/null; then
         log_warn "adb not found. Device deployment will be skipped."
     else
@@ -585,6 +590,18 @@ print_manual_install_instructions() {
     echo "To list available devices:"
     echo ""
     echo "  adb devices"
+    echo ""
+    echo "=== WSL2 with Windows Emulator ==="
+    echo ""
+    echo "If running in WSL2 with Android emulator on Windows, WSL2 adb cannot"
+    echo "see the Windows emulator. Use Windows adb.exe instead:"
+    echo ""
+    echo "  # From PowerShell/CMD, with APK path converted to Windows format:"
+    echo "  adb.exe install -r \\\\wsl\$\\Ubuntu$APK_PATH"
+    echo ""
+    echo "  # Or copy to Windows first:"
+    echo "  cp \"$APK_PATH\" /mnt/c/temp/"
+    echo "  # Then from PowerShell: adb.exe install -r C:\\temp\\app-release.apk"
     echo ""
 }
 
