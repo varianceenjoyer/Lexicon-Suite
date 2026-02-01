@@ -18,7 +18,7 @@ MOBILE_DIR="$SUITE_ROOT/Lexicon-Mobile"
 
 # Android NDK Configuration
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
-ANDROID_API="${ANDROID_API:-26}"
+ANDROID_API="${ANDROID_API:-30}"
 TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
 
@@ -311,19 +311,55 @@ build_rust_target() {
     mkdir -p "$WRAPPER_DIR"
 
     local REAL_CXX="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang++"
+    local REAL_CC="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
-    # Create C++ compiler wrapper that injects -stdlib=libc++
+    # Create C++ compiler wrapper that:
+    # 1. Injects -stdlib=libc++
+    # 2. Fixes --target to include API level (required for pthread_cond_clockwait on API 30+)
     cat > "$WRAPPER_DIR/clang++" << EOF
 #!/bin/bash
-# Wrapper to force libc++ for Android C++ compilation
-exec "$REAL_CXX" -stdlib=libc++ "\$@"
+# Wrapper to force libc++ and correct target for Android C++ compilation
+# Replace --target=aarch64-linux-android with --target=aarch64-linux-android${ANDROID_API}
+ARGS=()
+for arg in "\$@"; do
+    if [[ "\$arg" == "--target=aarch64-linux-android" ]]; then
+        ARGS+=("--target=aarch64-linux-android${ANDROID_API}")
+    elif [[ "\$arg" == "--target=x86_64-linux-android" ]]; then
+        ARGS+=("--target=x86_64-linux-android${ANDROID_API}")
+    elif [[ "\$arg" == "--target=armv7a-linux-androideabi" ]]; then
+        ARGS+=("--target=armv7a-linux-androideabi${ANDROID_API}")
+    else
+        ARGS+=("\$arg")
+    fi
+done
+exec "$REAL_CXX" -stdlib=libc++ "\${ARGS[@]}"
 EOF
     chmod +x "$WRAPPER_DIR/clang++"
 
+    # Create C compiler wrapper with same target fix
+    cat > "$WRAPPER_DIR/clang" << EOF
+#!/bin/bash
+# Wrapper to fix target for Android C compilation
+ARGS=()
+for arg in "\$@"; do
+    if [[ "\$arg" == "--target=aarch64-linux-android" ]]; then
+        ARGS+=("--target=aarch64-linux-android${ANDROID_API}")
+    elif [[ "\$arg" == "--target=x86_64-linux-android" ]]; then
+        ARGS+=("--target=x86_64-linux-android${ANDROID_API}")
+    elif [[ "\$arg" == "--target=armv7a-linux-androideabi" ]]; then
+        ARGS+=("--target=armv7a-linux-androideabi${ANDROID_API}")
+    else
+        ARGS+=("\$arg")
+    fi
+done
+exec "$REAL_CC" "\${ARGS[@]}"
+EOF
+    chmod +x "$WRAPPER_DIR/clang"
+
     # Run cargo build in a subshell to isolate environment changes
     (
-        export CC_${CC_VAR}="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
-        # Use wrapper for C++ to ensure -stdlib=libc++ is always passed
+        # Use wrappers for both C and C++ to ensure correct target with API level
+        export CC_${CC_VAR}="$WRAPPER_DIR/clang"
         export CXX_${CC_VAR}="$WRAPPER_DIR/clang++"
         export AR_${CC_VAR}="$TOOLCHAIN/llvm-ar"
 
@@ -356,8 +392,18 @@ EOF
         # Force CMake to use our wrapper compiler that injects -stdlib=libc++
         export CMAKE_CXX_COMPILER="$WRAPPER_DIR/clang++"
         export CMAKE_C_COMPILER="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
-        # Also set flags as backup
-        export CMAKE_CXX_FLAGS="-stdlib=libc++"
+
+        # ARM64-specific: Enable DOTPROD for whisper.cpp (~2x speedup for quantized ops)
+        # These CMAKE flags only affect CMake builds (whisper-rs-sys), not other crates
+        local WHISPER_ARCH_FLAGS=""
+        if [ "$TARGET" = "aarch64-linux-android" ]; then
+            WHISPER_ARCH_FLAGS="-march=armv8.2-a+dotprod"
+            log_info "Enabling ARMv8.2-A DOTPROD for whisper.cpp"
+        fi
+
+        # Set CMAKE flags with optional DOTPROD for whisper.cpp optimization
+        export CMAKE_CXX_FLAGS="-stdlib=libc++ $WHISPER_ARCH_FLAGS"
+        export CMAKE_C_FLAGS="$WHISPER_ARCH_FLAGS"
         export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CARGO_BUILD_JOBS
