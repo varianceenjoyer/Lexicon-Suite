@@ -7,3 +7,6 @@ Lexicon-Studio/
 
 # Build artifacts
 build/.clang-wrappers/
+
+# Claude
+.claude/plans/
