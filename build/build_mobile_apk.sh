@@ -395,6 +395,7 @@ EOF
 
         # ARM64-specific: Enable DOTPROD for whisper.cpp (~2x speedup for quantized ops)
         # Note: I8MM (ARMv8.6-A) was tested but causes SIGILL on some Cortex-A78 variants
+        # Note: OpenMP was tested but provided no benefit on Android ARM64 (~3320ms vs 3250ms)
         # These CMAKE flags only affect CMake builds (whisper-rs-sys), not other crates
         local WHISPER_ARCH_FLAGS=""
         if [ "$TARGET" = "aarch64-linux-android" ]; then
@@ -490,6 +491,8 @@ copy_library() {
     else
         log_warn "libc++_shared.so not found: $LIBCPP"
     fi
+
+    # Note: OpenMP is statically linked, no need to copy libomp.so
 }
 
 copy_libraries() {
