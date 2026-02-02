@@ -1,9 +1,11 @@
 #!/bin/bash
 # Unified Lexicon Mobile APK Build Script
-# Builds lexicon-flutter Rust library + Flutter APK in one command
+# Builds lexicon-flutter Rust library (with sherpa-onnx STT) + Flutter APK in one command
 #
 # Usage: ./build_mobile_apk.sh [target]
 #   Targets: arm64, x86_64 (default), arm32, all
+#
+# STT Engine: sherpa-onnx (ZipFormer) - ~68x faster than whisper on ARM64
 
 set -e
 
@@ -27,11 +29,12 @@ NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 
-# Model Configuration
-WHISPER_MODEL_ID="tiny-q5_1"
-WHISPER_MODEL_NAME="ggml-tiny-q5_1.bin"
-LEXICON_CLI="$LOCAL_SERVER_DIR/target/release/lexicon"
-LEXICON_MODEL_DIR="$HOME/.local/share/lexiconlocalserver/models"
+# Sherpa-ONNX Model Configuration
+# Note: sherpa-rs ZipFormer only supports OFFLINE models (not streaming)
+# The gigaspeech model is recommended for accuracy
+SHERPA_MODEL_NAME="sherpa-onnx-zipformer-gigaspeech-2023-12-12"
+SHERPA_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${SHERPA_MODEL_NAME}.tar.bz2"
+SHERPA_MODEL_DIR="$MOBILE_DIR/assets/models/sherpa"
 
 # Colors for output
 RED='\033[0;31m'
@@ -100,94 +103,93 @@ adjust_build_settings() {
 # Model Management Functions
 # =============================================================================
 
-ensure_lexicon_cli() {
-    if [ -x "$LEXICON_CLI" ]; then
-        log_success "Lexicon CLI found: $LEXICON_CLI"
-        return 0
+ensure_sherpa_model() {
+    local ARCHIVE_FILE="$SHERPA_MODEL_DIR/${SHERPA_MODEL_NAME}.tar.bz2"
+    local EXTRACTED_DIR="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
+
+    print_header "Ensuring Sherpa-ONNX Model"
+
+    # Check if model already extracted
+    if [ -d "$EXTRACTED_DIR" ]; then
+        # Verify key files exist
+        if ls "$EXTRACTED_DIR"/encoder*.onnx 1>/dev/null 2>&1 && \
+           ls "$EXTRACTED_DIR"/decoder*.onnx 1>/dev/null 2>&1 && \
+           ls "$EXTRACTED_DIR"/joiner*.onnx 1>/dev/null 2>&1 && \
+           [ -f "$EXTRACTED_DIR/tokens.txt" ]; then
+            local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
+            log_success "Sherpa model already exists: $EXTRACTED_DIR ($SIZE)"
+            return 0
+        else
+            log_warn "Model directory exists but missing files, re-extracting..."
+            rm -rf "$EXTRACTED_DIR"
+        fi
     fi
 
-    log_info "Lexicon CLI not found, building..."
-
-    if [ ! -f "$LOCAL_SERVER_DIR/scripts/build.sh" ]; then
-        log_error "Build script not found: $LOCAL_SERVER_DIR/scripts/build.sh"
-        return 1
-    fi
-
-    (
-        cd "$LOCAL_SERVER_DIR"
-        ./scripts/build.sh
-    )
-
-    if [ -x "$LEXICON_CLI" ]; then
-        log_success "Lexicon CLI built successfully"
-        return 0
-    else
-        log_error "Failed to build Lexicon CLI"
-        return 1
-    fi
-}
-
-ensure_whisper_model() {
-    local MOBILE_MODEL_DIR="$MOBILE_DIR/assets/models"
-    local MOBILE_MODEL_FILE="$MOBILE_MODEL_DIR/$WHISPER_MODEL_NAME"
-
-    print_header "Ensuring Whisper Model"
-
-    # Check if model already exists in mobile assets
-    if [ -f "$MOBILE_MODEL_FILE" ]; then
-        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
-        log_success "Model already exists: $MOBILE_MODEL_FILE ($SIZE)"
-        return 0
-    fi
-
-    # Check if model exists in Lexicon-Local-Server/models/ (bundled)
-    local SERVER_MODEL_FILE="$LOCAL_SERVER_DIR/models/$WHISPER_MODEL_NAME"
-    if [ -f "$SERVER_MODEL_FILE" ]; then
-        log_info "Found model in Lexicon-Local-Server/models/, copying..."
-        mkdir -p "$MOBILE_MODEL_DIR"
-        cp "$SERVER_MODEL_FILE" "$MOBILE_MODEL_FILE"
-        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
+    # Check if model exists in Lexicon-Local-Server/models/sherpa/ (cached)
+    local SERVER_MODEL_DIR="$LOCAL_SERVER_DIR/models/sherpa/$SHERPA_MODEL_NAME"
+    if [ -d "$SERVER_MODEL_DIR" ]; then
+        log_info "Found model in Lexicon-Local-Server/models/sherpa/, copying..."
+        mkdir -p "$SHERPA_MODEL_DIR"
+        cp -r "$SERVER_MODEL_DIR" "$EXTRACTED_DIR"
+        local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
         log_success "Copied model to mobile assets ($SIZE)"
         return 0
     fi
 
-    # Check if model exists in lexicon cache
-    local CACHE_MODEL_FILE="$LEXICON_MODEL_DIR/$WHISPER_MODEL_NAME"
-    if [ -f "$CACHE_MODEL_FILE" ]; then
-        log_info "Found model in lexicon cache, copying..."
-        mkdir -p "$MOBILE_MODEL_DIR"
-        cp "$CACHE_MODEL_FILE" "$MOBILE_MODEL_FILE"
-        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
-        log_success "Copied model from cache ($SIZE)"
-        return 0
+    # Check if model archive exists in Lexicon-Local-Server/models/sherpa/
+    local SERVER_ARCHIVE="$LOCAL_SERVER_DIR/models/sherpa/${SHERPA_MODEL_NAME}.tar.bz2"
+    if [ -f "$SERVER_ARCHIVE" ]; then
+        log_info "Found model archive in Lexicon-Local-Server, extracting..."
+        mkdir -p "$SHERPA_MODEL_DIR"
+        cp "$SERVER_ARCHIVE" "$ARCHIVE_FILE"
     fi
 
-    # Need to download via lexicon CLI
-    log_info "Model not found locally, downloading via lexicon CLI..."
+    # Download archive if not present
+    if [ ! -f "$ARCHIVE_FILE" ]; then
+        log_info "Downloading Sherpa model: $SHERPA_MODEL_NAME"
+        log_info "URL: $SHERPA_MODEL_URL"
+        log_info "This may take a while (~320MB)..."
 
-    # Ensure lexicon CLI exists
-    if ! ensure_lexicon_cli; then
-        log_error "Cannot download model: lexicon CLI unavailable"
-        return 1
+        mkdir -p "$SHERPA_MODEL_DIR"
+
+        if ! curl -L -o "$ARCHIVE_FILE" "$SHERPA_MODEL_URL" --progress-bar; then
+            log_error "Failed to download Sherpa model"
+            rm -f "$ARCHIVE_FILE"
+            return 1
+        fi
+
+        local ARCHIVE_SIZE=$(ls -lh "$ARCHIVE_FILE" | awk '{print $5}')
+        log_success "Downloaded archive ($ARCHIVE_SIZE)"
+    else
+        log_info "Archive already exists: $ARCHIVE_FILE"
     fi
 
-    # Download the model
-    log_info "Downloading model: $WHISPER_MODEL_ID"
-    if ! "$LEXICON_CLI" models download "$WHISPER_MODEL_ID"; then
-        log_error "Failed to download model"
-        return 1
-    fi
+    # Extract archive
+    log_info "Extracting Sherpa model..."
+    (
+        cd "$SHERPA_MODEL_DIR"
+        if ! tar xjf "${SHERPA_MODEL_NAME}.tar.bz2"; then
+            log_error "Failed to extract model archive"
+            return 1
+        fi
+    )
 
-    # Copy from cache to mobile assets
-    if [ -f "$CACHE_MODEL_FILE" ]; then
-        mkdir -p "$MOBILE_MODEL_DIR"
-        cp "$CACHE_MODEL_FILE" "$MOBILE_MODEL_FILE"
-        local SIZE=$(ls -lh "$MOBILE_MODEL_FILE" | awk '{print $5}')
-        log_success "Model downloaded and copied to mobile assets ($SIZE)"
+    # Verify extraction
+    if [ -d "$EXTRACTED_DIR" ]; then
+        local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
+        log_success "Model extracted successfully ($SIZE)"
+
+        # List contents for verification
+        log_info "Model files:"
+        ls -lh "$EXTRACTED_DIR"/*.onnx "$EXTRACTED_DIR"/tokens.txt 2>/dev/null | while read line; do
+            echo "  $line"
+        done
+
+        # Optionally remove archive to save space
+        # rm -f "$ARCHIVE_FILE"
         return 0
     else
-        log_error "Model download succeeded but file not found at expected location"
-        log_error "Expected: $CACHE_MODEL_FILE"
+        log_error "Extraction failed - model directory not found"
         return 1
     fi
 }
@@ -256,12 +258,12 @@ check_prerequisites() {
     fi
 
     # Check assets (informational - model will be downloaded if missing)
-    local MODEL_FILE="$MOBILE_DIR/assets/models/$WHISPER_MODEL_NAME"
-    if [ ! -f "$MODEL_FILE" ]; then
-        log_info "Whisper model not found (will be downloaded automatically)"
+    local MODEL_DIR="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
+    if [ ! -d "$MODEL_DIR" ]; then
+        log_info "Sherpa model not found (will be downloaded automatically)"
     else
-        local MODEL_SIZE=$(ls -lh "$MODEL_FILE" | awk '{print $5}')
-        log_success "Whisper model found: $WHISPER_MODEL_NAME ($MODEL_SIZE)"
+        local MODEL_SIZE=$(du -sh "$MODEL_DIR" | awk '{print $1}')
+        log_success "Sherpa model found: $SHERPA_MODEL_NAME ($MODEL_SIZE)"
     fi
 
     local TEST_AUDIO="$MOBILE_DIR/assets/audio/woodchuck.wav"
@@ -367,9 +369,21 @@ EOF
         CARGO_TARGET_VAR="CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
         export "${CARGO_TARGET_VAR}"="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
+        # CRITICAL: Configure bindgen for Android cross-compilation
+        # sherpa-rs-sys uses bindgen which needs Android NDK headers, not host headers
+        local NDK_SYSROOT_INC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+        local TARGET_INC="$NDK_SYSROOT_INC/$TARGET"
+
+        # Set bindgen args for this specific target
+        BINDGEN_TARGET_VAR="BINDGEN_EXTRA_CLANG_ARGS_$(echo "$TARGET" | tr '-' '_')"
+        export "${BINDGEN_TARGET_VAR}"="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$NDK_SYSROOT_INC -I$TARGET_INC"
+
+        # Also set generic bindgen args as fallback
+        export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$NDK_SYSROOT_INC -I$TARGET_INC"
+
         # CRITICAL: Force libc++ usage for Android compatibility
         # Android uses libc++, not libstdc++. Without these flags, C++ dependencies
-        # (like whisper.cpp) will link against libstdc++ symbols that don't exist on Android.
+        # will link against libstdc++ symbols that don't exist on Android.
         export CXXFLAGS="-stdlib=libc++"
         export CFLAGS=""
         export LDFLAGS="-stdlib=libc++ -lc++_shared"
@@ -393,27 +407,15 @@ EOF
         export CMAKE_CXX_COMPILER="$WRAPPER_DIR/clang++"
         export CMAKE_C_COMPILER="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
-        # ARM64-specific: Enable DOTPROD for whisper.cpp (~2x speedup for quantized ops)
-        # Note: I8MM (ARMv8.6-A) was tested but causes SIGILL on some Cortex-A78 variants
-        # Note: OpenMP was tested but provided no benefit on Android ARM64 (~3320ms vs 3250ms)
-        # These CMAKE flags only affect CMake builds (whisper-rs-sys), not other crates
-        local WHISPER_ARCH_FLAGS=""
-        if [ "$TARGET" = "aarch64-linux-android" ]; then
-            WHISPER_ARCH_FLAGS="-march=armv8.2-a+dotprod"
-            log_info "Enabling ARMv8.2-A DOTPROD for whisper.cpp"
-        fi
-
-        # Set CMAKE flags with optional DOTPROD for whisper.cpp optimization
-        export CMAKE_CXX_FLAGS="-stdlib=libc++ $WHISPER_ARCH_FLAGS"
-        export CMAKE_C_FLAGS="$WHISPER_ARCH_FLAGS"
+        # Set CMAKE flags for C++ stdlib
+        # Note: Whisper-specific DOTPROD optimizations removed (using sherpa-onnx instead)
+        export CMAKE_CXX_FLAGS="-stdlib=libc++"
+        export CMAKE_C_FLAGS=""
         export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CARGO_BUILD_JOBS
 
         cd "$LOCAL_SERVER_DIR"
-
-        # Clean whisper-rs-sys build cache to force rebuild with new flags
-        rm -rf target/$TARGET/release/build/whisper-rs-sys-* 2>/dev/null || true
 
         if [ "$FEATURES" = "default" ]; then
             cargo build -p lexicon-flutter --target "$TARGET" --release
@@ -438,23 +440,27 @@ build_rust_libraries() {
 
     print_header "Building Rust Libraries"
 
+    # Using stt-all feature to include both whisper and sherpa-onnx
+    # The app will use SherpaTranscriber but FFI requires all symbols present
+    # sherpa-onnx provides ~68x faster inference than whisper on ARM64
+
     case "$TARGETS" in
         arm64)
-            # Use stt-only features for arm64 to avoid ONNX Runtime libstdc++ issues
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt" "arm64-v8a"
-            log_warn "TTS disabled for arm64 (ONNX Runtime has libstdc++ compatibility issues)"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-all" "arm64-v8a"
+            log_info "Using sherpa-onnx STT engine (TTS disabled - ONNX Runtime libstdc++ issues)"
             ;;
         x86_64)
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt" "x86_64"
-            log_warn "TTS disabled for x86_64 (ONNX Runtime not available)"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-all" "x86_64"
+            log_info "Using sherpa-onnx STT engine (TTS disabled - ONNX Runtime not available)"
             ;;
         arm32)
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt" "armeabi-v7a"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-all" "armeabi-v7a"
+            log_info "Using sherpa-onnx STT engine"
             ;;
         all)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "default" "arm64-v8a"
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt" "x86_64"
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt" "armeabi-v7a"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-all" "arm64-v8a"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-all" "x86_64"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-all" "armeabi-v7a"
             ;;
     esac
 
@@ -490,6 +496,25 @@ copy_library() {
         log_success "Copied libc++_shared.so -> jniLibs/$ABI/"
     else
         log_warn "libc++_shared.so not found: $LIBCPP"
+    fi
+
+    # Copy sherpa-onnx dependencies (built by sherpa-rs-sys during cargo build)
+    local SHERPA_API="$LOCAL_SERVER_DIR/target/$RUST_TARGET/release/libsherpa-onnx-c-api.so"
+    if [ -f "$SHERPA_API" ]; then
+        cp "$SHERPA_API" "$JNILIBS_DIR/"
+        local SIZE=$(ls -lh "$SHERPA_API" | awk '{print $5}')
+        log_success "Copied libsherpa-onnx-c-api.so -> jniLibs/$ABI/ ($SIZE)"
+    else
+        log_warn "libsherpa-onnx-c-api.so not found: $SHERPA_API"
+    fi
+
+    local ONNX_RT="$LOCAL_SERVER_DIR/target/$RUST_TARGET/release/libonnxruntime.so"
+    if [ -f "$ONNX_RT" ]; then
+        cp "$ONNX_RT" "$JNILIBS_DIR/"
+        local SIZE=$(ls -lh "$ONNX_RT" | awk '{print $5}')
+        log_success "Copied libonnxruntime.so -> jniLibs/$ABI/ ($SIZE)"
+    else
+        log_warn "libonnxruntime.so not found: $ONNX_RT"
     fi
 
     # Note: OpenMP is statically linked, no need to copy libomp.so
@@ -535,9 +560,10 @@ build_flutter_apk() {
 
     # List bundled assets
     log_info "Bundled assets:" >&2
-    if [ -f "$MOBILE_DIR/assets/models/ggml-base-q5_1.bin" ]; then
-        local MODEL_SIZE=$(ls -lh "$MOBILE_DIR/assets/models/ggml-base-q5_1.bin" | awk '{print $5}')
-        log_info "  - Whisper model: ggml-base-q5_1.bin ($MODEL_SIZE)" >&2
+    local SHERPA_EXTRACTED="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
+    if [ -d "$SHERPA_EXTRACTED" ]; then
+        local MODEL_SIZE=$(du -sh "$SHERPA_EXTRACTED" | awk '{print $1}')
+        log_info "  - Sherpa model: $SHERPA_MODEL_NAME ($MODEL_SIZE)" >&2
     fi
     if [ -f "$MOBILE_DIR/assets/audio/woodchuck.wav" ]; then
         local AUDIO_SIZE=$(ls -lh "$MOBILE_DIR/assets/audio/woodchuck.wav" | awk '{print $5}')
@@ -771,7 +797,7 @@ print_usage() {
     echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 2, auto-adjusts based on available RAM)"
     echo ""
     echo "Bundled Assets (in Lexicon-Mobile/assets/):"
-    echo "  models/ggml-base-q5_1.bin  Whisper base model for STT (auto-downloaded)"
+    echo "  models/sherpa/<model>/     Sherpa-ONNX model for STT (auto-downloaded)"
     echo "  audio/woodchuck.wav        Test audio for transcription (optional)"
     echo ""
     echo "Examples:"
@@ -847,7 +873,7 @@ main() {
     adjust_build_settings
 
     if [ "$SKIP_MODEL" = false ]; then
-        ensure_whisper_model
+        ensure_sherpa_model
     else
         log_info "Skipping model check (--skip-model)"
     fi
