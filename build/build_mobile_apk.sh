@@ -394,6 +394,7 @@ EOF
         export CMAKE_C_COMPILER="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
         # ARM64-specific: Enable DOTPROD for whisper.cpp (~2x speedup for quantized ops)
+        # Note: I8MM (ARMv8.6-A) was tested but causes SIGILL on some Cortex-A78 variants
         # These CMAKE flags only affect CMake builds (whisper-rs-sys), not other crates
         local WHISPER_ARCH_FLAGS=""
         if [ "$TARGET" = "aarch64-linux-android" ]; then
