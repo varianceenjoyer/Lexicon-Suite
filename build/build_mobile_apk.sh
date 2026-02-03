@@ -785,7 +785,7 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  --skip-rust    Skip Rust library build (use existing)"
-    echo "  --skip-model   Skip Whisper model check/download"
+    echo "  --skip-model   Skip Sherpa model check/download"
     echo "  --skip-deploy  Skip device deployment"
     echo "  --clean        Force full Flutter rebuild (default: incremental)"
     echo "  --keep-daemons Keep Gradle/Kotlin daemons running after build"
