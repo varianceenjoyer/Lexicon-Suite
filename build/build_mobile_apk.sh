@@ -880,6 +880,9 @@ main() {
 
     if [ "$SKIP_RUST" = false ]; then
         build_rust_libraries "$TARGET"
+        # Drop filesystem cache after Rust build to free RAM before Gradle
+        log_info "Clearing filesystem cache before Flutter/Gradle build..."
+        drop_filesystem_cache
     else
         log_info "Skipping Rust build (--skip-rust)"
     fi
