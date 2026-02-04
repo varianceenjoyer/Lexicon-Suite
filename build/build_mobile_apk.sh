@@ -446,21 +446,21 @@ build_rust_libraries() {
 
     case "$TARGETS" in
         arm64)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-all" "arm64-v8a"
-            log_info "Using sherpa-onnx STT engine (TTS disabled - ONNX Runtime libstdc++ issues)"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-sherpa" "arm64-v8a"
+            log_info "Using sherpa-onnx STT engine"
             ;;
         x86_64)
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-all" "x86_64"
-            log_info "Using sherpa-onnx STT engine (TTS disabled - ONNX Runtime not available)"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-sherpa" "x86_64"
+            log_info "Using sherpa-onnx STT engine"
             ;;
         arm32)
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-all" "armeabi-v7a"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-sherpa" "armeabi-v7a"
             log_info "Using sherpa-onnx STT engine"
             ;;
         all)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-all" "arm64-v8a"
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-all" "x86_64"
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-all" "armeabi-v7a"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-sherpa" "arm64-v8a"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-sherpa" "x86_64"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-sherpa" "armeabi-v7a"
             ;;
     esac
 
