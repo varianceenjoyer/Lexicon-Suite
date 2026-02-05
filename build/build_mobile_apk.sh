@@ -32,7 +32,7 @@ BUILD_TYPE="${BUILD_TYPE:-release}"
 # Sherpa-ONNX Model Configuration
 # Note: sherpa-rs ZipFormer only supports OFFLINE models (not streaming)
 # The gigaspeech model is recommended for accuracy
-SHERPA_MODEL_NAME="sherpa-onnx-zipformer-gigaspeech-2023-12-12"
+SHERPA_MODEL_NAME="sherpa-onnx-zipformer-en-libriheavy-20230926-large"
 SHERPA_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${SHERPA_MODEL_NAME}.tar.bz2"
 SHERPA_MODEL_DIR="$MOBILE_DIR/assets/models/sherpa"
 
@@ -109,18 +109,18 @@ ensure_sherpa_model() {
 
     print_header "Ensuring Sherpa-ONNX Model"
 
-    # Check if model already extracted
+    # Check if model already extracted and converted to ORT format
     if [ -d "$EXTRACTED_DIR" ]; then
-        # Verify key files exist
-        if ls "$EXTRACTED_DIR"/encoder*.onnx 1>/dev/null 2>&1 && \
-           ls "$EXTRACTED_DIR"/decoder*.onnx 1>/dev/null 2>&1 && \
-           ls "$EXTRACTED_DIR"/joiner*.onnx 1>/dev/null 2>&1 && \
+        # Verify key ORT files exist (int8 versions for mobile)
+        if ls "$EXTRACTED_DIR"/encoder*.int8.ort 1>/dev/null 2>&1 && \
+           ls "$EXTRACTED_DIR"/decoder*.int8.ort 1>/dev/null 2>&1 && \
+           ls "$EXTRACTED_DIR"/joiner*.int8.ort 1>/dev/null 2>&1 && \
            [ -f "$EXTRACTED_DIR/tokens.txt" ]; then
             local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
-            log_success "Sherpa model already exists: $EXTRACTED_DIR ($SIZE)"
+            log_success "Sherpa model (ORT format) already exists: $EXTRACTED_DIR ($SIZE)"
             return 0
         else
-            log_warn "Model directory exists but missing files, re-extracting..."
+            log_warn "Model directory exists but missing ORT files, re-extracting..."
             rm -rf "$EXTRACTED_DIR"
         fi
     fi
@@ -179,18 +179,83 @@ ensure_sherpa_model() {
         local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
         log_success "Model extracted successfully ($SIZE)"
 
-        # List contents for verification
-        log_info "Model files:"
-        ls -lh "$EXTRACTED_DIR"/*.onnx "$EXTRACTED_DIR"/tokens.txt 2>/dev/null | while read line; do
+        # Convert ONNX to ORT format for 4x faster load times
+        convert_onnx_to_ort "$EXTRACTED_DIR"
+
+        # List final contents
+        log_info "Model files (ORT format):"
+        ls -lh "$EXTRACTED_DIR"/*.int8.ort "$EXTRACTED_DIR"/tokens.txt 2>/dev/null | while read line; do
             echo "  $line"
         done
 
-        # Optionally remove archive to save space
-        # rm -f "$ARCHIVE_FILE"
+        local FINAL_SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
+        log_success "Final model size: $FINAL_SIZE"
+
         return 0
     else
         log_error "Extraction failed - model directory not found"
         return 1
+    fi
+}
+
+# Convert ONNX models to ORT format for faster loading (~4x speedup)
+convert_onnx_to_ort() {
+    local MODEL_DIR="$1"
+
+    # Check if already converted
+    if ls "$MODEL_DIR"/*.int8.ort 1>/dev/null 2>&1; then
+        log_info "ORT files already exist, skipping conversion"
+        return 0
+    fi
+
+    log_info "Converting ONNX models to ORT format..."
+
+    # Check for Python and onnxruntime
+    local VENV_DIR="$MOBILE_DIR/.venv"
+    if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/python3" ]; then
+        local PYTHON="$VENV_DIR/bin/python3"
+    elif command -v python3 &>/dev/null; then
+        local PYTHON="python3"
+    else
+        log_warn "Python not found, skipping ORT conversion (will use slower ONNX format)"
+        return 0
+    fi
+
+    # Check if onnxruntime is available
+    if ! "$PYTHON" -c "import onnxruntime" 2>/dev/null; then
+        log_warn "onnxruntime not installed, skipping ORT conversion"
+        return 0
+    fi
+
+    # Run conversion
+    (
+        cd "$MODEL_DIR"
+        if "$PYTHON" -m onnxruntime.tools.convert_onnx_models_to_ort . 2>&1 | grep -v "^W\|Warning"; then
+            log_success "ORT conversion complete"
+        else
+            log_warn "ORT conversion had issues, checking results..."
+        fi
+    )
+
+    # Verify conversion produced int8.ort files
+    if ls "$MODEL_DIR"/*.int8.ort 1>/dev/null 2>&1; then
+        log_success "ORT int8 files created"
+
+        # Clean up: remove large files we don't need for mobile (keep only *.int8.ort)
+        log_info "Cleaning up unnecessary files..."
+        rm -f "$MODEL_DIR"/*.onnx                      # Remove all ONNX files
+        rm -f "$MODEL_DIR"/*.with_runtime_opt.ort      # Remove runtime opt variants
+        # Remove fp32 ORT files (non-int8) - use find to exclude int8 files
+        find "$MODEL_DIR" -name "*.ort" ! -name "*.int8.ort" -delete
+        rm -f "$MODEL_DIR"/required_operators*.config  # Remove config files
+        rm -f "$MODEL_DIR"/bpe.model                   # Remove BPE model (use tokens.txt)
+        rm -rf "$MODEL_DIR"/test_wavs                  # Remove test audio
+        rm -rf "$MODEL_DIR"/.git                       # Remove git if cloned
+
+        local CLEANED_SIZE=$(du -sh "$MODEL_DIR" | awk '{print $1}')
+        log_success "Cleaned up to $CLEANED_SIZE (int8 ORT only)"
+    else
+        log_warn "ORT conversion did not produce int8.ort files, keeping ONNX"
     fi
 }
 
