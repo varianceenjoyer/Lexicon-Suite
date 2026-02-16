@@ -1,11 +1,11 @@
 #!/bin/bash
 # Unified Lexicon Mobile APK Build Script
-# Builds lexicon-flutter Rust library (with sherpa-onnx STT) + Flutter APK in one command
+# Builds lexicon-flutter Rust library (with Parakeet STT) + Flutter APK in one command
 #
 # Usage: ./build_mobile_apk.sh [target]
 #   Targets: arm64, x86_64 (default), arm32, all
 #
-# STT Engine: sherpa-onnx (ZipFormer) - ~68x faster than whisper on ARM64
+# STT Engine: Parakeet CTC (FastConformer via parakeet-rs + ONNX Runtime)
 
 set -e
 
@@ -29,12 +29,13 @@ NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 
-# Sherpa-ONNX Model Configuration
-# Note: sherpa-rs ZipFormer only supports OFFLINE models (not streaming)
-# The gigaspeech model is recommended for accuracy
-SHERPA_MODEL_NAME="sherpa-onnx-zipformer-en-libriheavy-20230926-large"
-SHERPA_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${SHERPA_MODEL_NAME}.tar.bz2"
-SHERPA_MODEL_DIR="$MOBILE_DIR/assets/models/sherpa"
+# Parakeet CTC Model Configuration
+# NVIDIA Parakeet CTC 0.6B - FastConformer encoder, English, built-in punctuation
+# Uses shared ONNX Runtime (ort crate) - no separate sherpa-onnx runtime needed
+PARAKEET_MODEL_NAME="parakeet-ctc-0.6b"
+PARAKEET_REPO="onnx-community/parakeet-ctc-0.6b-ONNX"
+PARAKEET_BASE_URL="https://huggingface.co/${PARAKEET_REPO}/resolve/main"
+PARAKEET_MODEL_DIR="$MOBILE_DIR/assets/models/parakeet"
 
 # Colors for output
 RED='\033[0;31m'
@@ -103,159 +104,130 @@ adjust_build_settings() {
 # Model Management Functions
 # =============================================================================
 
-ensure_sherpa_model() {
-    local ARCHIVE_FILE="$SHERPA_MODEL_DIR/${SHERPA_MODEL_NAME}.tar.bz2"
-    local EXTRACTED_DIR="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
+ensure_parakeet_model() {
+    local MODEL_DEST="$PARAKEET_MODEL_DIR/$PARAKEET_MODEL_NAME"
 
-    print_header "Ensuring Sherpa-ONNX Model"
+    print_header "Ensuring Parakeet CTC Model"
 
-    # Check if model already extracted and converted to ORT format
-    if [ -d "$EXTRACTED_DIR" ]; then
-        # Verify key ORT files exist (int8 versions for mobile)
-        if ls "$EXTRACTED_DIR"/encoder*.int8.ort 1>/dev/null 2>&1 && \
-           ls "$EXTRACTED_DIR"/decoder*.int8.ort 1>/dev/null 2>&1 && \
-           ls "$EXTRACTED_DIR"/joiner*.int8.ort 1>/dev/null 2>&1 && \
-           [ -f "$EXTRACTED_DIR/tokens.txt" ]; then
-            local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
-            log_success "Sherpa model (ORT format) already exists: $EXTRACTED_DIR ($SIZE)"
+    # Check if model already downloaded with required files
+    if [ -d "$MODEL_DEST" ]; then
+        if [ -f "$MODEL_DEST/tokenizer.json" ] && \
+           (ls "$MODEL_DEST"/model*.onnx 1>/dev/null 2>&1 || ls "$MODEL_DEST"/model*.onnx_data 1>/dev/null 2>&1); then
+            local SIZE=$(du -sh "$MODEL_DEST" | awk '{print $1}')
+            log_success "Parakeet model already exists: $MODEL_DEST ($SIZE)"
             return 0
         else
-            log_warn "Model directory exists but missing ORT files, re-extracting..."
-            rm -rf "$EXTRACTED_DIR"
+            log_warn "Model directory exists but missing required files, re-downloading..."
+            rm -rf "$MODEL_DEST"
         fi
     fi
 
-    # Check if model exists in Lexicon-Local-Server/models/sherpa/ (cached)
-    local SERVER_MODEL_DIR="$LOCAL_SERVER_DIR/models/sherpa/$SHERPA_MODEL_NAME"
-    if [ -d "$SERVER_MODEL_DIR" ]; then
-        log_info "Found model in Lexicon-Local-Server/models/sherpa/, copying..."
-        mkdir -p "$SHERPA_MODEL_DIR"
-        cp -r "$SERVER_MODEL_DIR" "$EXTRACTED_DIR"
-        local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
+    # Check if model exists in Lexicon-Local-Server/models/ (cached)
+    local SERVER_MODEL_DIR="$LOCAL_SERVER_DIR/models/$PARAKEET_MODEL_NAME"
+    if [ -d "$SERVER_MODEL_DIR" ] && [ -f "$SERVER_MODEL_DIR/tokenizer.json" ]; then
+        log_info "Found model in Lexicon-Local-Server/models/, copying..."
+        mkdir -p "$PARAKEET_MODEL_DIR"
+        cp -r "$SERVER_MODEL_DIR" "$MODEL_DEST"
+        local SIZE=$(du -sh "$MODEL_DEST" | awk '{print $1}')
         log_success "Copied model to mobile assets ($SIZE)"
         return 0
     fi
 
-    # Check if model archive exists in Lexicon-Local-Server/models/sherpa/
-    local SERVER_ARCHIVE="$LOCAL_SERVER_DIR/models/sherpa/${SHERPA_MODEL_NAME}.tar.bz2"
-    if [ -f "$SERVER_ARCHIVE" ]; then
-        log_info "Found model archive in Lexicon-Local-Server, extracting..."
-        mkdir -p "$SHERPA_MODEL_DIR"
-        cp "$SERVER_ARCHIVE" "$ARCHIVE_FILE"
-    fi
+    # Download model files from HuggingFace
+    log_info "Downloading Parakeet CTC model: $PARAKEET_MODEL_NAME"
+    log_info "Source: $PARAKEET_REPO"
+    log_info "This may take a while (~2.3GB for fp32)..."
 
-    # Download archive if not present
-    if [ ! -f "$ARCHIVE_FILE" ]; then
-        log_info "Downloading Sherpa model: $SHERPA_MODEL_NAME"
-        log_info "URL: $SHERPA_MODEL_URL"
-        log_info "This may take a while (~320MB)..."
+    mkdir -p "$MODEL_DEST"
 
-        mkdir -p "$SHERPA_MODEL_DIR"
-
-        if ! curl -L -o "$ARCHIVE_FILE" "$SHERPA_MODEL_URL" --progress-bar; then
-            log_error "Failed to download Sherpa model"
-            rm -f "$ARCHIVE_FILE"
+    # Download tokenizer.json
+    if [ ! -f "$MODEL_DEST/tokenizer.json" ]; then
+        log_info "Downloading tokenizer.json..."
+        if ! curl -L -o "$MODEL_DEST/tokenizer.json" "${PARAKEET_BASE_URL}/tokenizer.json" --progress-bar; then
+            log_error "Failed to download tokenizer.json"
             return 1
         fi
-
-        local ARCHIVE_SIZE=$(ls -lh "$ARCHIVE_FILE" | awk '{print $5}')
-        log_success "Downloaded archive ($ARCHIVE_SIZE)"
-    else
-        log_info "Archive already exists: $ARCHIVE_FILE"
+        log_success "Downloaded tokenizer.json"
     fi
 
-    # Extract archive
-    log_info "Extracting Sherpa model..."
-    (
-        cd "$SHERPA_MODEL_DIR"
-        if ! tar xjf "${SHERPA_MODEL_NAME}.tar.bz2"; then
-            log_error "Failed to extract model archive"
+    # Download model.onnx (fp32 - verified to work on CPU)
+    if [ ! -f "$MODEL_DEST/model.onnx" ]; then
+        log_info "Downloading model.onnx..."
+        if ! curl -L -o "$MODEL_DEST/model.onnx" "${PARAKEET_BASE_URL}/onnx/model.onnx" --progress-bar; then
+            log_error "Failed to download model.onnx"
             return 1
         fi
-    )
-
-    # Verify extraction
-    if [ -d "$EXTRACTED_DIR" ]; then
-        local SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
-        log_success "Model extracted successfully ($SIZE)"
-
-        # Convert ONNX to ORT format for 4x faster load times
-        convert_onnx_to_ort "$EXTRACTED_DIR"
-
-        # List final contents
-        log_info "Model files (ORT format):"
-        ls -lh "$EXTRACTED_DIR"/*.int8.ort "$EXTRACTED_DIR"/tokens.txt 2>/dev/null | while read line; do
-            echo "  $line"
-        done
-
-        local FINAL_SIZE=$(du -sh "$EXTRACTED_DIR" | awk '{print $1}')
-        log_success "Final model size: $FINAL_SIZE"
-
-        return 0
-    else
-        log_error "Extraction failed - model directory not found"
-        return 1
+        local SIZE=$(ls -lh "$MODEL_DEST/model.onnx" | awk '{print $5}')
+        log_success "Downloaded model.onnx ($SIZE)"
     fi
+
+    # Download model.onnx_data (external data file)
+    if [ ! -f "$MODEL_DEST/model.onnx_data" ]; then
+        log_info "Downloading model.onnx_data..."
+        if ! curl -L -o "$MODEL_DEST/model.onnx_data" "${PARAKEET_BASE_URL}/onnx/model.onnx_data" --progress-bar; then
+            log_error "Failed to download model.onnx_data"
+            return 1
+        fi
+        local SIZE=$(ls -lh "$MODEL_DEST/model.onnx_data" | awk '{print $5}')
+        log_success "Downloaded model.onnx_data ($SIZE)"
+    fi
+
+    # Optionally quantize to dynamic INT8 for smaller size (~65% reduction)
+    quantize_parakeet_model "$MODEL_DEST"
+
+    # List final contents
+    log_info "Model files:"
+    ls -lh "$MODEL_DEST"/ 2>/dev/null | while read line; do
+        echo "  $line"
+    done
+
+    local FINAL_SIZE=$(du -sh "$MODEL_DEST" | awk '{print $1}')
+    log_success "Final model size: $FINAL_SIZE"
 }
 
-# Convert ONNX models to ORT format for faster loading (~4x speedup)
-convert_onnx_to_ort() {
+# Optionally quantize Parakeet fp32 model to dynamic INT8 for smaller APK
+# Reduces ~2.3GB to ~804MB with identical accuracy on CPU
+quantize_parakeet_model() {
     local MODEL_DIR="$1"
+    local QUANTIZE_SCRIPT="$LOCAL_SERVER_DIR/scripts/quantize-parakeet-qdq.py"
 
-    # Check if already converted
-    if ls "$MODEL_DIR"/*.int8.ort 1>/dev/null 2>&1; then
-        log_info "ORT files already exist, skipping conversion"
+    # Skip if already quantized (look for int8 model files)
+    if [ -f "$MODEL_DIR/model_int8_qdq.onnx" ]; then
+        log_info "INT8 quantized model already exists, skipping quantization"
         return 0
     fi
 
-    log_info "Converting ONNX models to ORT format..."
+    # Check if quantization script exists
+    if [ ! -f "$QUANTIZE_SCRIPT" ]; then
+        log_info "Quantization script not found, using fp32 model"
+        return 0
+    fi
 
-    # Check for Python and onnxruntime
-    local VENV_DIR="$MOBILE_DIR/.venv"
-    if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/python3" ]; then
-        local PYTHON="$VENV_DIR/bin/python3"
-    elif command -v python3 &>/dev/null; then
-        local PYTHON="python3"
+    # Check for Python and required packages
+    local PYTHON=""
+    if command -v python3 &>/dev/null; then
+        PYTHON="python3"
     else
-        log_warn "Python not found, skipping ORT conversion (will use slower ONNX format)"
+        log_info "Python not found, using fp32 model"
         return 0
     fi
 
-    # Check if onnxruntime is available
-    if ! "$PYTHON" -c "import onnxruntime" 2>/dev/null; then
-        log_warn "onnxruntime not installed, skipping ORT conversion"
+    if ! "$PYTHON" -c "import onnxruntime; import onnx" 2>/dev/null; then
+        log_info "onnxruntime/onnx not installed, using fp32 model"
+        log_info "Install with: pip install onnxruntime onnx"
         return 0
     fi
 
-    # Run conversion
-    (
-        cd "$MODEL_DIR"
-        if "$PYTHON" -m onnxruntime.tools.convert_onnx_models_to_ort . 2>&1 | grep -v "^W\|Warning"; then
-            log_success "ORT conversion complete"
-        else
-            log_warn "ORT conversion had issues, checking results..."
+    log_info "Quantizing model to dynamic INT8 (reduces ~2.3GB to ~804MB)..."
+    if "$PYTHON" "$QUANTIZE_SCRIPT" "$MODEL_DIR" 2>&1; then
+        # If quantization succeeded, clean up fp32 files to save space
+        if [ -f "$MODEL_DIR/model_int8_qdq.onnx" ]; then
+            log_success "Quantization complete, removing fp32 model files"
+            rm -f "$MODEL_DIR/model.onnx"
+            rm -f "$MODEL_DIR/model.onnx_data"
         fi
-    )
-
-    # Verify conversion produced int8.ort files
-    if ls "$MODEL_DIR"/*.int8.ort 1>/dev/null 2>&1; then
-        log_success "ORT int8 files created"
-
-        # Clean up: remove large files we don't need for mobile (keep only *.int8.ort)
-        log_info "Cleaning up unnecessary files..."
-        rm -f "$MODEL_DIR"/*.onnx                      # Remove all ONNX files
-        rm -f "$MODEL_DIR"/*.with_runtime_opt.ort      # Remove runtime opt variants
-        # Remove fp32 ORT files (non-int8) - use find to exclude int8 files
-        find "$MODEL_DIR" -name "*.ort" ! -name "*.int8.ort" -delete
-        rm -f "$MODEL_DIR"/required_operators*.config  # Remove config files
-        rm -f "$MODEL_DIR"/bpe.model                   # Remove BPE model (use tokens.txt)
-        rm -rf "$MODEL_DIR"/test_wavs                  # Remove test audio
-        rm -rf "$MODEL_DIR"/.git                       # Remove git if cloned
-
-        local CLEANED_SIZE=$(du -sh "$MODEL_DIR" | awk '{print $1}')
-        log_success "Cleaned up to $CLEANED_SIZE (int8 ORT only)"
     else
-        log_warn "ORT conversion did not produce int8.ort files, keeping ONNX"
+        log_warn "Quantization failed, using fp32 model"
     fi
 }
 
@@ -322,13 +294,24 @@ check_prerequisites() {
         log_success "Lexicon-Mobile found"
     fi
 
+    # Check ONNX Runtime Android AAR (required for x86_64/arm32, optional for arm64)
+    local ORT_ANDROID_DIR="$HOME/.onnxruntime-android"
+    if [ -d "$ORT_ANDROID_DIR/jni" ]; then
+        local ORT_ARCHS=$(ls "$ORT_ANDROID_DIR/jni/" | tr '\n' ', ' | sed 's/,$//')
+        log_success "ONNX Runtime Android AAR found ($ORT_ARCHS)"
+    else
+        log_warn "ONNX Runtime Android AAR not found at $ORT_ANDROID_DIR"
+        log_info "x86_64/arm32 builds need it. Download: https://github.com/microsoft/onnxruntime/releases"
+        log_info "Extract AAR (zip) and place jni/ and headers/ under $ORT_ANDROID_DIR"
+    fi
+
     # Check assets (informational - model will be downloaded if missing)
-    local MODEL_DIR="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
+    local MODEL_DIR="$PARAKEET_MODEL_DIR/$PARAKEET_MODEL_NAME"
     if [ ! -d "$MODEL_DIR" ]; then
-        log_info "Sherpa model not found (will be downloaded automatically)"
+        log_info "Parakeet model not found (will be downloaded automatically)"
     else
         local MODEL_SIZE=$(du -sh "$MODEL_DIR" | awk '{print $1}')
-        log_success "Sherpa model found: $SHERPA_MODEL_NAME ($MODEL_SIZE)"
+        log_success "Parakeet model found: $PARAKEET_MODEL_NAME ($MODEL_SIZE)"
     fi
 
     local TEST_AUDIO="$MOBILE_DIR/assets/audio/woodchuck.wav"
@@ -435,7 +418,7 @@ EOF
         export "${CARGO_TARGET_VAR}"="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
         # CRITICAL: Configure bindgen for Android cross-compilation
-        # sherpa-rs-sys uses bindgen which needs Android NDK headers, not host headers
+        # onig_sys and other -sys crates use bindgen which needs Android NDK headers, not host headers
         local NDK_SYSROOT_INC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
         local TARGET_INC="$NDK_SYSROOT_INC/$TARGET"
 
@@ -473,12 +456,22 @@ EOF
         export CMAKE_C_COMPILER="$TOOLCHAIN/${CC_BIN}${ANDROID_API}-clang"
 
         # Set CMAKE flags for C++ stdlib
-        # Note: Whisper-specific DOTPROD optimizations removed (using sherpa-onnx instead)
+        # Note: Whisper-specific DOTPROD optimizations removed (using Parakeet via ort instead)
         export CMAKE_CXX_FLAGS="-stdlib=libc++"
         export CMAKE_C_FLAGS=""
         export CMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -lc++_shared"
         export CARGO_BUILD_JOBS
+
+        # ONNX Runtime for Android: use prebuilt .so from official AAR release
+        # ort-sys only has prebuilt static libs for aarch64; for other targets (x86_64, armv7)
+        # we must provide the library via ORT_LIB_LOCATION + dynamic linking
+        local ORT_ANDROID_DIR="$HOME/.onnxruntime-android"
+        if [ -d "$ORT_ANDROID_DIR/jni/$ABI" ]; then
+            export ORT_LIB_LOCATION="$ORT_ANDROID_DIR/jni/$ABI"
+            export ORT_PREFER_DYNAMIC_LINK=1
+            log_info "Using ONNX Runtime from $ORT_LIB_LOCATION"
+        fi
 
         cd "$LOCAL_SERVER_DIR"
 
@@ -505,27 +498,26 @@ build_rust_libraries() {
 
     print_header "Building Rust Libraries"
 
-    # Using stt-all feature to include both whisper and sherpa-onnx
-    # The app will use SherpaTranscriber but FFI requires all symbols present
-    # sherpa-onnx provides ~68x faster inference than whisper on ARM64
+    # Using stt-parakeet feature for Parakeet CTC (FastConformer via ONNX Runtime)
+    # Parakeet shares the ort crate with TTS, no separate runtime needed
 
     case "$TARGETS" in
         arm64)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-sherpa" "arm64-v8a"
-            log_info "Using sherpa-onnx STT engine"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet" "arm64-v8a"
+            log_info "Using Parakeet CTC STT engine"
             ;;
         x86_64)
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-sherpa" "x86_64"
-            log_info "Using sherpa-onnx STT engine"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet" "x86_64"
+            log_info "Using Parakeet CTC STT engine"
             ;;
         arm32)
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-sherpa" "armeabi-v7a"
-            log_info "Using sherpa-onnx STT engine"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet" "armeabi-v7a"
+            log_info "Using Parakeet CTC STT engine"
             ;;
         all)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-sherpa" "arm64-v8a"
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-sherpa" "x86_64"
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-sherpa" "armeabi-v7a"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet" "arm64-v8a"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet" "x86_64"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet" "armeabi-v7a"
             ;;
     esac
 
@@ -563,26 +555,27 @@ copy_library() {
         log_warn "libc++_shared.so not found: $LIBCPP"
     fi
 
-    # Copy sherpa-onnx dependencies (built by sherpa-rs-sys during cargo build)
-    local SHERPA_API="$LOCAL_SERVER_DIR/target/$RUST_TARGET/release/libsherpa-onnx-c-api.so"
-    if [ -f "$SHERPA_API" ]; then
-        cp "$SHERPA_API" "$JNILIBS_DIR/"
-        local SIZE=$(ls -lh "$SHERPA_API" | awk '{print $5}')
-        log_success "Copied libsherpa-onnx-c-api.so -> jniLibs/$ABI/ ($SIZE)"
-    else
-        log_warn "libsherpa-onnx-c-api.so not found: $SHERPA_API"
+    # Remove stale sherpa .so if present (from previous sherpa-based builds)
+    rm -f "$JNILIBS_DIR/libsherpa-onnx-c-api.so"
+
+    # Copy ONNX Runtime shared library (used by ort crate for Parakeet STT)
+    # With ORT_PREFER_DYNAMIC_LINK, the .so comes from the official Android AAR, not Rust output
+    local ONNX_RT=""
+    local ORT_AAR_LIB="$HOME/.onnxruntime-android/jni/$ABI/libonnxruntime.so"
+    local ORT_RUST_LIB="$LOCAL_SERVER_DIR/target/$RUST_TARGET/release/libonnxruntime.so"
+    if [ -f "$ORT_AAR_LIB" ]; then
+        ONNX_RT="$ORT_AAR_LIB"
+    elif [ -f "$ORT_RUST_LIB" ]; then
+        ONNX_RT="$ORT_RUST_LIB"
     fi
 
-    local ONNX_RT="$LOCAL_SERVER_DIR/target/$RUST_TARGET/release/libonnxruntime.so"
-    if [ -f "$ONNX_RT" ]; then
+    if [ -n "$ONNX_RT" ]; then
         cp "$ONNX_RT" "$JNILIBS_DIR/"
         local SIZE=$(ls -lh "$ONNX_RT" | awk '{print $5}')
         log_success "Copied libonnxruntime.so -> jniLibs/$ABI/ ($SIZE)"
     else
-        log_warn "libonnxruntime.so not found: $ONNX_RT"
+        log_warn "libonnxruntime.so not found (checked AAR and Rust output)"
     fi
-
-    # Note: OpenMP is statically linked, no need to copy libomp.so
 }
 
 copy_libraries() {
@@ -625,10 +618,10 @@ build_flutter_apk() {
 
     # List bundled assets
     log_info "Bundled assets:" >&2
-    local SHERPA_EXTRACTED="$SHERPA_MODEL_DIR/$SHERPA_MODEL_NAME"
-    if [ -d "$SHERPA_EXTRACTED" ]; then
-        local MODEL_SIZE=$(du -sh "$SHERPA_EXTRACTED" | awk '{print $1}')
-        log_info "  - Sherpa model: $SHERPA_MODEL_NAME ($MODEL_SIZE)" >&2
+    local PARAKEET_EXTRACTED="$PARAKEET_MODEL_DIR/$PARAKEET_MODEL_NAME"
+    if [ -d "$PARAKEET_EXTRACTED" ]; then
+        local MODEL_SIZE=$(du -sh "$PARAKEET_EXTRACTED" | awk '{print $1}')
+        log_info "  - Parakeet model: $PARAKEET_MODEL_NAME ($MODEL_SIZE)" >&2
     fi
     if [ -f "$MOBILE_DIR/assets/audio/woodchuck.wav" ]; then
         local AUDIO_SIZE=$(ls -lh "$MOBILE_DIR/assets/audio/woodchuck.wav" | awk '{print $5}')
@@ -850,7 +843,7 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  --skip-rust    Skip Rust library build (use existing)"
-    echo "  --skip-model   Skip Sherpa model check/download"
+    echo "  --skip-model   Skip Parakeet model check/download"
     echo "  --skip-deploy  Skip device deployment"
     echo "  --clean        Force full Flutter rebuild (default: incremental)"
     echo "  --keep-daemons Keep Gradle/Kotlin daemons running after build"
@@ -862,7 +855,7 @@ print_usage() {
     echo "  CARGO_BUILD_JOBS    Parallel cargo jobs (default: 2, auto-adjusts based on available RAM)"
     echo ""
     echo "Bundled Assets (in Lexicon-Mobile/assets/):"
-    echo "  models/sherpa/<model>/     Sherpa-ONNX model for STT (auto-downloaded)"
+    echo "  models/parakeet/<model>/   Parakeet CTC model for STT (auto-downloaded)"
     echo "  audio/woodchuck.wav        Test audio for transcription (optional)"
     echo ""
     echo "Examples:"
@@ -938,7 +931,7 @@ main() {
     adjust_build_settings
 
     if [ "$SKIP_MODEL" = false ]; then
-        ensure_sherpa_model
+        ensure_parakeet_model
     else
         log_info "Skipping model check (--skip-model)"
     fi
