@@ -175,6 +175,9 @@ ensure_parakeet_model() {
     # Optionally quantize to dynamic INT8 for smaller size (~65% reduction)
     quantize_parakeet_model "$MODEL_DEST"
 
+    # Convert to ORT format for ~10x faster model loading
+    convert_to_ort "$MODEL_DEST"
+
     # List final contents
     log_info "Model files:"
     ls -lh "$MODEL_DEST"/ 2>/dev/null | while read line; do
@@ -191,8 +194,8 @@ quantize_parakeet_model() {
     local MODEL_DIR="$1"
     local QUANTIZE_SCRIPT="$LOCAL_SERVER_DIR/scripts/quantize-parakeet-qdq.py"
 
-    # Skip if already quantized (look for int8 model files)
-    if [ -f "$MODEL_DIR/model_int8_qdq.onnx" ]; then
+    # Skip if already quantized or converted to ORT
+    if [ -f "$MODEL_DIR/model_int8_qdq.onnx" ] || ls "$MODEL_DIR"/*int8*.ort 1>/dev/null 2>&1; then
         log_info "INT8 quantized model already exists, skipping quantization"
         return 0
     fi
@@ -228,6 +231,58 @@ quantize_parakeet_model() {
         fi
     else
         log_warn "Quantization failed, using fp32 model"
+    fi
+}
+
+# Convert ONNX model to ORT format for faster loading (~10x improvement)
+# ORT format uses FlatBuffers for zero-copy deserialization
+convert_to_ort() {
+    local MODEL_DIR="$1"
+
+    # Skip if already converted
+    if ls "$MODEL_DIR"/*.ort 1>/dev/null 2>&1; then
+        log_info "ORT format model already exists, skipping conversion"
+        return 0
+    fi
+
+    # Need an ONNX file to convert
+    local ONNX_FILE=""
+    for f in "$MODEL_DIR"/model*.onnx; do
+        if [ -f "$f" ] && [[ "$f" != *.onnx_data ]]; then
+            ONNX_FILE="$f"
+            break
+        fi
+    done
+
+    if [ -z "$ONNX_FILE" ]; then
+        log_info "No ONNX model found to convert"
+        return 0
+    fi
+
+    # Check for Python with onnxruntime
+    local PYTHON=""
+    if [ -x "/tmp/ort-quantize/bin/python" ]; then
+        PYTHON="/tmp/ort-quantize/bin/python"
+    elif command -v python3 &>/dev/null && python3 -c "import onnxruntime" 2>/dev/null; then
+        PYTHON="python3"
+    else
+        log_info "Python with onnxruntime not found, using ONNX format"
+        return 0
+    fi
+
+    log_info "Converting to ORT format (faster model loading)..."
+    if "$PYTHON" -m onnxruntime.tools.convert_onnx_models_to_ort \
+        --target_platform arm "$MODEL_DIR" 2>&1; then
+        # Clean up: keep only the fixed-optimization .ort, remove runtime_opt and configs
+        rm -f "$MODEL_DIR"/*.with_runtime_opt.ort
+        rm -f "$MODEL_DIR"/required_operators*.config
+        # Remove source ONNX files (now superseded by .ort)
+        rm -f "$MODEL_DIR"/model*.onnx
+        rm -f "$MODEL_DIR"/model*.onnx_data
+        local ORT_SIZE=$(du -sh "$MODEL_DIR"/*.ort 2>/dev/null | awk '{print $1}')
+        log_success "ORT conversion complete ($ORT_SIZE)"
+    else
+        log_warn "ORT conversion failed, using ONNX format"
     fi
 }
 
