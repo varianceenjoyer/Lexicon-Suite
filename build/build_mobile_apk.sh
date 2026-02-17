@@ -558,21 +558,21 @@ build_rust_libraries() {
 
     case "$TARGETS" in
         arm64)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet" "arm64-v8a"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet,noise-reduction" "arm64-v8a"
             log_info "Using Parakeet CTC STT engine"
             ;;
         x86_64)
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet" "x86_64"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet,noise-reduction" "x86_64"
             log_info "Using Parakeet CTC STT engine"
             ;;
         arm32)
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet" "armeabi-v7a"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet,noise-reduction" "armeabi-v7a"
             log_info "Using Parakeet CTC STT engine"
             ;;
         all)
-            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet" "arm64-v8a"
-            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet" "x86_64"
-            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet" "armeabi-v7a"
+            build_rust_target "aarch64-linux-android" "aarch64_linux_android" "aarch64-linux-android" "stt-parakeet,noise-reduction" "arm64-v8a"
+            build_rust_target "x86_64-linux-android" "x86_64_linux_android" "x86_64-linux-android" "stt-parakeet,noise-reduction" "x86_64"
+            build_rust_target "armv7-linux-androideabi" "armv7_linux_androideabi" "armv7a-linux-androideabi" "stt-parakeet,noise-reduction" "armeabi-v7a"
             ;;
     esac
 
