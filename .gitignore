@@ -11,3 +11,12 @@ build/archive/
 
 # Claude
 .claude/plans/
+# Local secrets / machine config
+.env
+.env.*
+*.jks
+*.keystore
+*.pem
+*.p12
+key.properties
+local.properties
